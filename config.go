@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 	"within.website/ln"
@@ -18,12 +20,86 @@ import (
 )
 
 type Config struct {
+	InstanceID string   `yaml:"instance-id"`
+	Hostname   string   `yaml:"hostname"`
 	Users      []User   `yaml:"users,omitempty"`
 	Files      []File   `yaml:"files,omitempty"`
 	RunCommand []string `yaml:"runcmd,omitempty"`
 }
 
+func instanceIDSemaphore(id string) (bool, error) {
+	os.MkdirAll("/var/cloud", 0700)
+	sem := filepath.Join("/var/cloud", id)
+
+	_, err := os.Stat(sem)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		fout, err := os.Create(sem)
+		if err != nil {
+			return false, fmt.Errorf("can't make %s: %w", sem, err)
+		}
+		fmt.Fprint(fout, id)
+		err = fout.Close()
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func changeHostname(ctx context.Context, hostname string) error {
+	current, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("can't get current hostname: %w", err)
+	}
+
+	f := ln.F{"to": hostname, "from": current}
+
+	if hostname == current {
+		ln.Log(ctx, ln.Fmt("hostname matches target, doing nothing"), f)
+	}
+
+	ln.Log(ctx, f)
+	st, err := os.Stat("/etc/hostname")
+	if err != nil {
+		return fmt.Errorf("can't query old hostname setting: %w", err)
+	}
+	err = os.Remove("/etc/hostname")
+	if err != nil {
+		return fmt.Errorf("can't remove old hostname setting: %w", err)
+	}
+
+	err = os.WriteFile("/etc/hostname", []byte(hostname), st.Mode())
+	if err != nil {
+		return fmt.Errorf("can't write new hostname: %w", err)
+	}
+
+	err = syscall.Sethostname([]byte(hostname))
+	if err != nil {
+		return fmt.Errorf("can't set hostname: %w", err)
+	}
+
+	return nil
+}
+
 func (c Config) Apply(ctx context.Context) error {
+	if ok, err := instanceIDSemaphore(c.InstanceID); !ok || err != nil {
+		if err != nil {
+			return fmt.Errorf("error making instance id semaphore: %w", err)
+		}
+		ln.Log(ctx, ln.Fmt("already ran before, no reason to run now"))
+		return nil
+	}
+
+	{
+		ctx := opname.With(ctx, "hostname")
+		err := changeHostname(ctx, c.Hostname)
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, u := range c.Users {
 		ctx := opname.With(ctx, "mkuser")
 		err := u.Apply(ctx)
